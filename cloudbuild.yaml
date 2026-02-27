@@ -1,0 +1,46 @@
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/gemini-web-navigator:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/gemini-web-navigator:latest'
+      - '.'
+
+  # Push to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/gemini-web-navigator:$COMMIT_SHA'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/gemini-web-navigator:latest'
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'gemini-web-navigator'
+      - '--image=gcr.io/$PROJECT_ID/gemini-web-navigator:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--memory=2Gi'
+      - '--cpu=2'
+      - '--timeout=300'
+      - '--concurrency=10'
+      - '--set-env-vars=GEMINI_API_KEY=$$GEMINI_API_KEY'
+      - '--update-secrets=GEMINI_API_KEY=gemini-api-key:latest'
+
+images:
+  - 'gcr.io/$PROJECT_ID/gemini-web-navigator:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/gemini-web-navigator:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
