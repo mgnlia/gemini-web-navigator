@@ -10,8 +10,9 @@ import base64
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from io import BytesIO
 from typing import AsyncGenerator, Optional
 
 from google import genai
@@ -84,8 +85,12 @@ Rules:
 """
 
 
-def _call_gemini(client: genai.Client, image_bytes: bytes, prompt: str) -> str:
-    """Single Gemini API call; returns raw response text."""
+def _build_gemini_request(
+    client: genai.Client,
+    image_bytes: bytes,
+    prompt: str,
+) -> str:
+    """Call Gemini and return the raw text response."""
     response = client.models.generate_content(
         model=MODEL,
         contents=[
@@ -95,8 +100,7 @@ def _call_gemini(client: genai.Client, image_bytes: bytes, prompt: str) -> str:
                     types.Part(
                         inline_data=types.Blob(
                             mime_type="image/png",
-                            # Fix 1: pass raw PNG bytes directly — no PIL decode/re-encode
-                            data=image_bytes,
+                            data=image_bytes,  # raw bytes — no PIL re-encoding
                         )
                     ),
                     types.Part(text=prompt),
@@ -115,7 +119,7 @@ def _call_gemini(client: genai.Client, image_bytes: bytes, prompt: str) -> str:
 def _strip_markdown(raw: str) -> str:
     raw = re.sub(r"^```(?:json)?\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
-    return raw.strip()
+    return raw
 
 
 async def get_next_action(
@@ -126,10 +130,11 @@ async def get_next_action(
 ) -> Action:
     """Send screenshot to Gemini 2.0 Flash and get the next action.
 
-    Fix 1: screenshot bytes are decoded once and sent as-is — no PIL round-trip.
-    Fix 2: JSON parse failures trigger up to 3 fresh Gemini API calls before
-           returning Action(FAIL) instead of raising an exception.
+    Fix 1: screenshot bytes are sent directly — no PIL decode/re-encode round-trip.
+    Fix 2: JSON parse failures retry up to 3 times with fresh Gemini calls before
+           falling back to a FAIL action instead of raising.
     """
+
     # Build history context (last 5 steps)
     history_text = ""
     if history:
@@ -140,36 +145,34 @@ async def get_next_action(
 
     prompt = f"Goal: {goal}{history_text}\n\nWhat is the next action to take? Respond with JSON only."
 
-    # Fix 1: decode once — raw PNG bytes go straight to the API
+    # Fix 1: decode once — send raw bytes, skip PIL re-encoding
     image_bytes = base64.b64decode(screenshot_b64)
 
-    # Fix 2: retry loop — re-call Gemini on JSON parse failure (up to 3 attempts)
+    # Fix 2: retry loop — re-call Gemini on JSON parse failure
     last_err: Exception | None = None
     raw: str = ""
-    data: dict = {}
-
     for attempt in range(3):
         try:
-            raw = _call_gemini(client, image_bytes, prompt)
+            raw = _build_gemini_request(client, image_bytes, prompt)
             raw = _strip_markdown(raw)
             data = json.loads(raw)
-            break  # success
-        except json.JSONDecodeError as exc:
-            last_err = exc
+            break
+        except json.JSONDecodeError as e:
+            last_err = e
             if attempt < 2:
                 await asyncio.sleep(0.5 * (attempt + 1))
-                continue  # retry with a fresh Gemini call
-        except Exception as exc:
-            # Non-JSON error (network, quota, etc.) — don't retry
-            return Action(type=ActionType.FAIL, reason=f"Gemini error: {exc}")
+                continue
+        except Exception as e:
+            # Non-JSON error (network, API quota, etc.) — don't retry
+            return Action(type=ActionType.FAIL, reason=f"Gemini error: {e}")
     else:
-        # All 3 attempts exhausted
         return Action(
             type=ActionType.FAIL,
             reason=f"JSON parse failed after 3 retries: {last_err}. Raw: {raw[:200]}",
         )
 
     action_type = ActionType(data.get("action", "fail"))
+
     return Action(
         type=action_type,
         x=data.get("x"),
@@ -191,12 +194,27 @@ async def take_screenshot(page: Page) -> str:
     return base64.b64encode(screenshot_bytes).decode()
 
 
+async def _wait_for_navigation(page: Page, timeout_ms: int = 3000) -> None:
+    """SPA-safe post-click wait.
+
+    Fix 7: the original code used wait_for_load_state("networkidle", timeout=5000)
+    which hangs indefinitely on SPAs that keep background connections open.
+    Strategy: try domcontentloaded first (fast), then a short fixed sleep as
+    fallback. Never block on networkidle after a click.
+    """
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except Exception:
+        # No navigation occurred (SPA click, JS handler, etc.) — just wait briefly
+        await asyncio.sleep(0.5)
+
+
 async def execute_action(page: Page, action: Action) -> tuple[bool, str]:
     """Execute a browser action. Returns (success, message)."""
     try:
         if action.type == ActionType.CLICK:
             await page.mouse.click(action.x, action.y)
-            await page.wait_for_load_state("networkidle", timeout=5000)
+            await _wait_for_navigation(page)  # Fix 7: SPA-safe, replaces networkidle
             return True, f"Clicked at ({action.x}, {action.y})"
 
         elif action.type == ActionType.TYPE:
@@ -210,7 +228,7 @@ async def execute_action(page: Page, action: Action) -> tuple[bool, str]:
             return True, f"Scrolled {action.direction} {action.amount}px"
 
         elif action.type == ActionType.NAVIGATE:
-            await page.goto(action.url, wait_until="networkidle", timeout=30000)
+            await page.goto(action.url, wait_until="domcontentloaded", timeout=30000)
             return True, f"Navigated to {action.url}"
 
         elif action.type == ActionType.WAIT:
@@ -243,8 +261,8 @@ async def run_navigator(
     Yields StepResult for each step (for SSE streaming).
 
     Args:
-        stop_event: optional asyncio.Event — when set, the loop exits cleanly
-                    after the current step (Fix 3 session-stop integration).
+        stop_event: optional asyncio.Event; when set, the loop exits cleanly
+                    after the current step completes (Fix 3 — AbortController).
     """
     client = genai.Client(api_key=api_key)
     history: list[dict] = []
@@ -256,23 +274,27 @@ async def run_navigator(
         )
         context = await browser.new_context(
             viewport={"width": SCREENSHOT_WIDTH, "height": SCREENSHOT_HEIGHT},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-            ),
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         )
         page = await context.new_page()
-        await page.goto(start_url, wait_until="networkidle", timeout=30000)
+
+        # Navigate to start URL
+        await page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
 
         for step in range(1, MAX_STEPS + 1):
-            # Fix 3: honour stop signal at the top of every iteration
+            # Fix 3: honour stop signal before each step
             if stop_event is not None and stop_event.is_set():
                 break
 
             t0 = time.time()
 
+            # 1. Screenshot
             screenshot_b64 = await take_screenshot(page)
+
+            # 2. Gemini vision → action
             action = await get_next_action(client, screenshot_b64, goal, history)
+
+            # 3. Execute
             success, message = await execute_action(page, action)
 
             elapsed = int((time.time() - t0) * 1000)
@@ -285,9 +307,15 @@ async def run_navigator(
                 elapsed_ms=elapsed,
             )
 
-            history.append({"step": step, "action": action.type.value, "message": message})
+            history.append({
+                "step": step,
+                "action": action.type.value,
+                "message": message,
+            })
+
             yield result
 
+            # Stop conditions
             if action.type in (ActionType.DONE, ActionType.FAIL):
                 break
 
@@ -308,10 +336,7 @@ if __name__ == "__main__":
 
     async def main():
         async for result in run_navigator(goal, api_key=api_key, headless=False):
-            print(
-                f"Step {result.step}: [{result.action.type.value}] "
-                f"{result.message} ({result.elapsed_ms}ms)"
-            )
+            print(f"Step {result.step}: [{result.action.type.value}] {result.message} ({result.elapsed_ms}ms)")
             if result.action.type in (ActionType.DONE, ActionType.FAIL):
                 print(f"\nFinal: {result.action.reason}")
                 break
