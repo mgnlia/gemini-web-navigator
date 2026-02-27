@@ -12,6 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from io import BytesIO
 from typing import AsyncGenerator, Optional
 
 from google import genai
@@ -84,13 +85,55 @@ Rules:
 """
 
 
+def _build_gemini_request(
+    client: genai.Client,
+    image_bytes: bytes,
+    prompt: str,
+) -> str:
+    """Call Gemini and return the raw text response."""
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        inline_data=types.Blob(
+                            mime_type="image/png",
+                            data=image_bytes,  # raw bytes — no PIL re-encoding
+                        )
+                    ),
+                    types.Part(text=prompt),
+                ],
+            )
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.1,
+            max_output_tokens=512,
+        ),
+    )
+    return response.text.strip()
+
+
+def _strip_markdown(raw: str) -> str:
+    raw = re.sub(r"^```(?:json)?\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    return raw
+
+
 async def get_next_action(
     client: genai.Client,
     screenshot_b64: str,
     goal: str,
     history: list[dict],
 ) -> Action:
-    """Send screenshot to Gemini 2.0 Flash and get the next action."""
+    """Send screenshot to Gemini 2.0 Flash and get the next action.
+
+    Fix 1: screenshot bytes are sent directly — no PIL decode/re-encode round-trip.
+    Fix 2: JSON parse failures retry up to 3 times with fresh Gemini calls before
+           falling back to a FAIL action instead of raising.
+    """
 
     # Build history context (last 5 steps)
     history_text = ""
@@ -102,60 +145,44 @@ async def get_next_action(
 
     prompt = f"Goal: {goal}{history_text}\n\nWhat is the next action to take? Respond with JSON only."
 
-    # Fix 1: screenshot_b64 is already a PNG encoded as base64 — use it directly,
-    # no need to decode → re-encode through PIL.
+    # Fix 1: decode once — send raw bytes, skip PIL re-encoding
     image_bytes = base64.b64decode(screenshot_b64)
 
-    # Fix 2: retry up to 3 times on JSON parse failure
-    last_exc: Exception | None = None
+    # Fix 2: retry loop — re-call Gemini on JSON parse failure
+    last_err: Exception | None = None
+    raw: str = ""
     for attempt in range(3):
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part(
-                            inline_data=types.Blob(
-                                mime_type="image/png",
-                                data=image_bytes,
-                            )
-                        ),
-                        types.Part(text=prompt),
-                    ],
-                )
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.1,
-                max_output_tokens=512,
-            ),
+        try:
+            raw = _build_gemini_request(client, image_bytes, prompt)
+            raw = _strip_markdown(raw)
+            data = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+        except Exception as e:
+            # Non-JSON error (network, API quota, etc.) — don't retry
+            return Action(type=ActionType.FAIL, reason=f"Gemini error: {e}")
+    else:
+        return Action(
+            type=ActionType.FAIL,
+            reason=f"JSON parse failed after 3 retries: {last_err}. Raw: {raw[:200]}",
         )
 
-        raw = response.text.strip()
-        # Strip markdown code blocks if present
-        raw = re.sub(r"^```(?:json)?\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
+    action_type = ActionType(data.get("action", "fail"))
 
-        try:
-            data = json.loads(raw)
-            action_type = ActionType(data.get("action", "fail"))
-            return Action(
-                type=action_type,
-                x=data.get("x"),
-                y=data.get("y"),
-                text=data.get("text"),
-                url=data.get("url"),
-                direction=data.get("direction"),
-                amount=data.get("amount", 300),
-                reason=data.get("reason", ""),
-            )
-        except (json.JSONDecodeError, ValueError) as exc:
-            last_exc = exc
-            # Retry — re-call the API on next iteration
-
-    # All 3 attempts failed
-    return Action(type=ActionType.FAIL, reason="JSON parse failed after 3 retries")
+    return Action(
+        type=action_type,
+        x=data.get("x"),
+        y=data.get("y"),
+        text=data.get("text"),
+        url=data.get("url"),
+        direction=data.get("direction"),
+        amount=data.get("amount", 300),
+        reason=data.get("reason", ""),
+    )
 
 
 # ── Browser Actions ───────────────────────────────────────────────────────────
@@ -217,7 +244,10 @@ async def run_navigator(
     """
     Core agent loop: screenshot → Gemini vision → action → execute → repeat.
     Yields StepResult for each step (for SSE streaming).
-    If stop_event is provided, the loop will exit cleanly when it is set.
+
+    Args:
+        stop_event: optional asyncio.Event; when set, the loop exits cleanly
+                    after the current step completes (Fix 3 — AbortController).
     """
     client = genai.Client(api_key=api_key)
     history: list[dict] = []
@@ -237,7 +267,7 @@ async def run_navigator(
         await page.goto(start_url, wait_until="networkidle", timeout=30000)
 
         for step in range(1, MAX_STEPS + 1):
-            # Fix 3: honour stop signal from /stop endpoint
+            # Fix 3: honour stop signal before each step
             if stop_event is not None and stop_event.is_set():
                 break
 
@@ -247,10 +277,7 @@ async def run_navigator(
             screenshot_b64 = await take_screenshot(page)
 
             # 2. Gemini vision → action
-            try:
-                action = await get_next_action(client, screenshot_b64, goal, history)
-            except Exception as e:
-                action = Action(type=ActionType.FAIL, reason=f"Gemini error: {e}")
+            action = await get_next_action(client, screenshot_b64, goal, history)
 
             # 3. Execute
             success, message = await execute_action(page, action)
@@ -278,7 +305,6 @@ async def run_navigator(
                 break
 
             if not success and action.type not in (ActionType.WAIT,):
-                # Give it one more try after a wait
                 await asyncio.sleep(2)
 
         await browser.close()
