@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv pip install --system -e ".[dev]" 2>/dev/null || uv pip install --system -e .
+
+      - name: Verify imports
+        run: python -c "import fastapi; import uvicorn; import PIL; print('All imports OK')"
+
+      - name: Check syntax
+        run: python -m py_compile agent.py main.py && echo "Syntax OK"
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t gemini-web-navigator:test .
+
+      - name: Test health endpoint
+        run: |
+          docker run -d -p 8080:8080 -e GEMINI_API_KEY=test-key --name nav gemini-web-navigator:test
+          sleep 10
+          curl -f http://localhost:8080/health || (docker logs nav && exit 1)
+          docker stop nav
