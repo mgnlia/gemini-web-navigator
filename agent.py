@@ -12,12 +12,10 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from io import BytesIO
 from typing import AsyncGenerator, Optional
 
 from google import genai
 from google.genai import types
-from PIL import Image
 from playwright.async_api import Page, async_playwright
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -104,53 +102,60 @@ async def get_next_action(
 
     prompt = f"Goal: {goal}{history_text}\n\nWhat is the next action to take? Respond with JSON only."
 
+    # Fix 1: screenshot_b64 is already a PNG encoded as base64 — use it directly,
+    # no need to decode → re-encode through PIL.
     image_bytes = base64.b64decode(screenshot_b64)
-    img = Image.open(BytesIO(image_bytes))
-    img_bytes = BytesIO()
-    img.save(img_bytes, format="PNG")
-    img_bytes.seek(0)
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part(
-                        inline_data=types.Blob(
-                            mime_type="image/png",
-                            data=img_bytes.getvalue(),
-                        )
-                    ),
-                    types.Part(text=prompt),
-                ],
+    # Fix 2: retry up to 3 times on JSON parse failure
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            inline_data=types.Blob(
+                                mime_type="image/png",
+                                data=image_bytes,
+                            )
+                        ),
+                        types.Part(text=prompt),
+                    ],
+                )
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.1,
+                max_output_tokens=512,
+            ),
+        )
+
+        raw = response.text.strip()
+        # Strip markdown code blocks if present
+        raw = re.sub(r"^```(?:json)?\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+
+        try:
+            data = json.loads(raw)
+            action_type = ActionType(data.get("action", "fail"))
+            return Action(
+                type=action_type,
+                x=data.get("x"),
+                y=data.get("y"),
+                text=data.get("text"),
+                url=data.get("url"),
+                direction=data.get("direction"),
+                amount=data.get("amount", 300),
+                reason=data.get("reason", ""),
             )
-        ],
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.1,
-            max_output_tokens=512,
-        ),
-    )
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_exc = exc
+            # Retry — re-call the API on next iteration
 
-    raw = response.text.strip()
-    # Strip markdown code blocks if present
-    raw = re.sub(r"^```(?:json)?\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
-
-    data = json.loads(raw)
-    action_type = ActionType(data.get("action", "fail"))
-
-    return Action(
-        type=action_type,
-        x=data.get("x"),
-        y=data.get("y"),
-        text=data.get("text"),
-        url=data.get("url"),
-        direction=data.get("direction"),
-        amount=data.get("amount", 300),
-        reason=data.get("reason", ""),
-    )
+    # All 3 attempts failed
+    return Action(type=ActionType.FAIL, reason="JSON parse failed after 3 retries")
 
 
 # ── Browser Actions ───────────────────────────────────────────────────────────
@@ -207,10 +212,12 @@ async def run_navigator(
     start_url: str = "https://www.google.com",
     api_key: str = "",
     headless: bool = True,
+    stop_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[StepResult, None]:
     """
     Core agent loop: screenshot → Gemini vision → action → execute → repeat.
     Yields StepResult for each step (for SSE streaming).
+    If stop_event is provided, the loop will exit cleanly when it is set.
     """
     client = genai.Client(api_key=api_key)
     history: list[dict] = []
@@ -230,6 +237,10 @@ async def run_navigator(
         await page.goto(start_url, wait_until="networkidle", timeout=30000)
 
         for step in range(1, MAX_STEPS + 1):
+            # Fix 3: honour stop signal from /stop endpoint
+            if stop_event is not None and stop_event.is_set():
+                break
+
             t0 = time.time()
 
             # 1. Screenshot
