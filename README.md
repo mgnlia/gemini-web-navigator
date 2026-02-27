@@ -58,6 +58,7 @@ Built for the [Gemini Live Agent Challenge](https://geminiliveagentchallenge.dev
 - 🧠 **Gemini 2.0 Flash** — fast multimodal vision for screenshot analysis
 - 🌐 **Universal** — works on any website without custom adapters
 - ☁️ **Cloud Run** — scalable, serverless deployment on Google Cloud
+- 🛑 **Session cancellation** — stop a running agent via `POST /stop/{session_id}`
 
 ## Tech Stack
 
@@ -104,29 +105,61 @@ uv run python agent.py "Search for Gemini AI on Google and click the first resul
 
 ### Deploy to Cloud Run
 
+The recommended path is via **Cloud Build** — it builds the Docker image, pushes it to
+Container Registry, and deploys to Cloud Run in one step.  
+`GEMINI_API_KEY` is read from [Secret Manager](https://cloud.google.com/secret-manager) 
+(secret name `gemini-api-key`) so it is never stored in source code or build logs.
+
 ```bash
-# Set your GCP project
+# 1. Store your API key in Secret Manager (one-time setup)
+echo -n "$GEMINI_API_KEY" | \
+  gcloud secrets create gemini-api-key --data-file=- --replication-policy=automatic
+
+# 2. Grant Cloud Build access to the secret
+gcloud secrets add-iam-policy-binding gemini-api-key \
+  --member="serviceAccount:$(gcloud projects describe $PROJECT_ID \
+      --format='value(projectNumber)')@cloudbuild.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# 3. Submit the build (builds image + deploys to Cloud Run)
 export PROJECT_ID=your-gcp-project
 
-# Build and deploy
 gcloud builds submit --config cloudbuild.yaml \
-  --substitutions=_PROJECT_ID=$PROJECT_ID
+  --project "$PROJECT_ID"
+```
 
-# Or manual deploy
+For a **manual one-shot deploy** (no Cloud Build), use:
+
+```bash
+export PROJECT_ID=your-gcp-project
+export GEMINI_API_KEY=your_key_here
+
+# Build & push image
 docker build -t gcr.io/$PROJECT_ID/gemini-web-navigator .
 docker push gcr.io/$PROJECT_ID/gemini-web-navigator
+
+# Deploy to Cloud Run
 gcloud run deploy gemini-web-navigator \
   --image gcr.io/$PROJECT_ID/gemini-web-navigator \
   --region us-central1 \
+  --platform managed \
   --allow-unauthenticated \
+  --memory 2Gi \
+  --cpu 2 \
+  --timeout 300 \
+  --concurrency 10 \
   --set-env-vars GEMINI_API_KEY=$GEMINI_API_KEY
 ```
+
+> **`--allow-unauthenticated`** is required so the public UI can reach the service without
+> Google credentials.  Pass `--no-allow-unauthenticated` and add IAM bindings if you want
+> to restrict access.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GEMINI_API_KEY` | ✅ | Google AI Studio API key |
+| `GEMINI_API_KEY` | ✅ | Google AI Studio API key — set via `--set-env-vars` or Secret Manager |
 
 ## API Reference
 
@@ -139,7 +172,8 @@ Run the navigator agent.
 {
   "goal": "Search for 'AI agents' on Google",
   "start_url": "https://www.google.com",
-  "headless": true
+  "headless": true,
+  "session_id": "my-unique-session-123"
 }
 ```
 
@@ -148,6 +182,15 @@ Run the navigator agent.
 data: {"type": "step", "step": 1, "action": "navigate", "message": "...", "screenshot": "<base64>", "elapsed_ms": 1200}
 data: {"type": "step", "step": 2, "action": "click", "message": "Clicked at (640, 400)", "screenshot": "<base64>", "elapsed_ms": 800}
 data: {"type": "done", "message": "Goal accomplished: Found AI agents article"}
+```
+
+### `POST /stop/{session_id}`
+
+Cancel a running agent session after the current step completes.
+
+```bash
+curl -X POST http://localhost:8080/stop/my-unique-session-123
+# {"status": "stopping", "session_id": "my-unique-session-123"}
 ```
 
 ### `GET /health`
