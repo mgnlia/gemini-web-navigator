@@ -1,11 +1,13 @@
 """
 Gemini Web Navigator — FastAPI Server
-POST /run  → SSE stream of agent steps
-GET  /health → health check
+POST /run                → SSE stream of agent steps
+POST /stop/{session_id}  → cancel a running session
+GET  /health             → health check
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Optional
@@ -23,6 +25,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Fix 4: CORS middleware — allow all origins so the UI can reach the API from any host
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,16 +36,30 @@ app.add_middleware(
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
+# Fix 3: per-session stop events so the client can cancel a running agent loop
+_stop_events: dict[str, asyncio.Event] = {}
+
 
 class RunRequest(BaseModel):
     goal: str
     start_url: Optional[str] = "https://www.google.com"
     headless: Optional[bool] = True
+    session_id: Optional[str] = None
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "gemini-web-navigator", "version": "1.0.0"}
+
+
+@app.post("/stop/{session_id}")
+async def stop_session(session_id: str):
+    """Signal a running agent session to stop after the current step."""
+    event = _stop_events.get(session_id)
+    if event is None:
+        raise HTTPException(404, f"Session '{session_id}' not found or already finished")
+    event.set()
+    return {"status": "stopping", "session_id": session_id}
 
 
 @app.post("/run")
@@ -52,9 +69,17 @@ async def run_agent(req: RunRequest):
     - {"type": "step", "step": N, "action": "...", "message": "...", "screenshot": "<base64>", "elapsed_ms": N}
     - {"type": "done", "message": "..."}
     - {"type": "error", "message": "..."}
+
+    Pass a unique `session_id` in the request body to enable cancellation via
+    POST /stop/{session_id}.
     """
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY environment variable not set")
+
+    # Fix 3: create and register a stop event for this session
+    session_id = req.session_id or str(id(req))
+    stop_event = asyncio.Event()
+    _stop_events[session_id] = stop_event
 
     async def stream():
         try:
@@ -63,7 +88,13 @@ async def run_agent(req: RunRequest):
                 start_url=req.start_url,
                 api_key=GEMINI_API_KEY,
                 headless=req.headless,
+                stop_event=stop_event,
             ):
+                # Fix 3: also check stop_event here so we can break the SSE stream
+                if stop_event.is_set():
+                    yield f"data: {json.dumps({'type': 'stopped', 'message': 'Session cancelled by client'})}\n\n"
+                    break
+
                 event = {
                     "type": "step",
                     "step": result.step,
@@ -85,6 +116,9 @@ async def run_agent(req: RunRequest):
 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        finally:
+            # Fix 3: clean up the stop event after the loop ends
+            _stop_events.pop(session_id, None)
 
     return StreamingResponse(
         stream(),
