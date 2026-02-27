@@ -20,8 +20,16 @@ COPY agent.py .
 COPY main.py .
 COPY static/ ./static/
 
-# Install dependencies
-RUN uv pip install --system -e .
+# Install dependencies directly (not editable)
+RUN uv pip install --system \
+    "google-genai>=1.0.0" \
+    "playwright>=1.42.0" \
+    "fastapi>=0.110.0" \
+    "uvicorn[standard]>=0.27.0" \
+    "pillow>=10.0.0" \
+    "python-multipart>=0.0.9" \
+    "pydantic>=2.0.0" \
+    "httpx>=0.27.0"
 
 # Install Playwright browsers
 RUN playwright install chromium
