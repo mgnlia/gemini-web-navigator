@@ -1,5 +1,5 @@
 steps:
-  # Build the Docker image
+  # ── 1. Build Docker image ────────────────────────────────────────────────────
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
@@ -9,18 +9,17 @@ steps:
       - 'gcr.io/$PROJECT_ID/gemini-web-navigator:latest'
       - '.'
 
-  # Push to Container Registry
+  # ── 2. Push to Container Registry ───────────────────────────────────────────
   - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/$PROJECT_ID/gemini-web-navigator:$COMMIT_SHA'
+    args: ['push', 'gcr.io/$PROJECT_ID/gemini-web-navigator:$COMMIT_SHA']
 
   - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/$PROJECT_ID/gemini-web-navigator:latest'
+    args: ['push', 'gcr.io/$PROJECT_ID/gemini-web-navigator:latest']
 
-  # Deploy to Cloud Run
+  # ── 3. Deploy to Cloud Run ───────────────────────────────────────────────────
+  # Fix 5: --allow-unauthenticated makes the service publicly reachable.
+  # GEMINI_API_KEY is injected at deploy time from Secret Manager
+  # (secret name: gemini-api-key) so it is never stored in source or build logs.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -30,12 +29,12 @@ steps:
       - '--image=gcr.io/$PROJECT_ID/gemini-web-navigator:$COMMIT_SHA'
       - '--region=us-central1'
       - '--platform=managed'
-      - '--allow-unauthenticated'
+      - '--allow-unauthenticated'          # Fix 5: public access — no Google auth required
       - '--memory=2Gi'
       - '--cpu=2'
       - '--timeout=300'
       - '--concurrency=10'
-      - '--set-env-vars=GEMINI_API_KEY=$$GEMINI_API_KEY'
+      # Fix 5: inject GEMINI_API_KEY from Secret Manager at deploy time
       - '--update-secrets=GEMINI_API_KEY=gemini-api-key:latest'
 
 images:
