@@ -21,7 +21,16 @@ jobs:
         run: pip install uv
 
       - name: Install dependencies
-        run: uv pip install --system -e ".[dev]" 2>/dev/null || uv pip install --system -e .
+        run: |
+          uv pip install --system \
+            "google-genai>=1.0.0" \
+            "playwright>=1.42.0" \
+            "fastapi>=0.110.0" \
+            "uvicorn[standard]>=0.27.0" \
+            "pillow>=10.0.0" \
+            "python-multipart>=0.0.9" \
+            "pydantic>=2.0.0" \
+            "httpx>=0.27.0"
 
       - name: Verify imports
         run: python -c "import fastapi; import uvicorn; import PIL; print('All imports OK')"
@@ -40,6 +49,6 @@ jobs:
       - name: Test health endpoint
         run: |
           docker run -d -p 8080:8080 -e GEMINI_API_KEY=test-key --name nav gemini-web-navigator:test
-          sleep 10
+          sleep 15
           curl -f http://localhost:8080/health || (docker logs nav && exit 1)
           docker stop nav
