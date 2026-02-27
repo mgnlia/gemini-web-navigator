@@ -1,9 +1,10 @@
 """
 Gemini Web Navigator — FastAPI Server
-POST /run/{session_id}  → SSE stream of agent steps
-POST /stop/{session_id} → cancel a running session
-GET  /health            → health check
-GET  /                  → web UI
+
+POST /run                → SSE stream of agent steps
+POST /stop/{session_id}  → cancel a running session (Fix 3)
+GET  /health             → health check
+GET  /                   → web UI
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ app = FastAPI(
     version="1.1.0",
 )
 
-# Fix 4 (already present — verified): CORS middleware
+# Fix 4: CORSMiddleware with allow_origins=["*"] added immediately after app creation
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,7 +39,7 @@ app.add_middleware(
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Fix 3: session stop registry — maps session_id → asyncio.Event
+# Fix 3: module-level stop-event registry — maps session_id → asyncio.Event
 _stop_events: dict[str, asyncio.Event] = {}
 
 
@@ -46,7 +47,8 @@ class RunRequest(BaseModel):
     goal: str
     start_url: Optional[str] = "https://www.google.com"
     headless: Optional[bool] = True
-    session_id: Optional[str] = None  # caller may supply; server generates if absent
+    # Caller may supply a stable session_id; server generates a UUID if absent
+    session_id: Optional[str] = None
 
 
 @app.get("/health")
@@ -54,26 +56,40 @@ async def health():
     return {"status": "ok", "service": "gemini-web-navigator", "version": "1.1.0"}
 
 
+# Fix 3: stop endpoint — sets the event so the agent loop exits after current step
+@app.post("/stop/{session_id}")
+async def stop_session(session_id: str):
+    """Signal a running session to stop cleanly after the current step."""
+    event = _stop_events.get(session_id)
+    if event is None:
+        raise HTTPException(404, f"Session '{session_id}' not found or already finished")
+    event.set()
+    return {"status": "stopping", "session_id": session_id}
+
+
 @app.post("/run")
 async def run_agent(req: RunRequest):
     """
     Run the navigator agent. Streams SSE events:
-    - {"type": "session", "session_id": "<id>"}   — first event, use for /stop
-    - {"type": "step", "step": N, "action": "...", "message": "...", "screenshot": "<base64>", "elapsed_ms": N}
-    - {"type": "done", "message": "..."}
-    - {"type": "error", "message": "..."}
-    - {"type": "stopped"}                          — emitted when /stop was called
+
+    - {"type": "session",  "session_id": "<id>"}          — first event; use for /stop
+    - {"type": "step",     "step": N, "action": "...", "message": "...",
+       "screenshot": "<base64>", "elapsed_ms": N}
+    - {"type": "done",     "message": "..."}
+    - {"type": "error",    "message": "..."}
+    - {"type": "stopped"}                                  — emitted when /stop was called
     """
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY environment variable not set")
 
+    # Fix 3: create and register a stop event for this session
     session_id = req.session_id or str(uuid.uuid4())
     stop_event = asyncio.Event()
     _stop_events[session_id] = stop_event
 
     async def stream():
         try:
-            # First event: hand the session_id to the client so it can call /stop
+            # Emit session_id first so the client can call /stop if needed
             yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
 
             async for result in run_navigator(
@@ -81,14 +97,14 @@ async def run_agent(req: RunRequest):
                 start_url=req.start_url,
                 api_key=GEMINI_API_KEY,
                 headless=req.headless,
-                stop_event=stop_event,
+                stop_event=stop_event,  # Fix 3: pass event into agent loop
             ):
-                # Check stop between steps
+                # Fix 3: check stop between steps in the SSE layer too
                 if stop_event.is_set():
                     yield f"data: {json.dumps({'type': 'stopped'})}\n\n"
                     break
 
-                event = {
+                event_payload = {
                     "type": "step",
                     "step": result.step,
                     "action": result.action.type.value,
@@ -98,7 +114,7 @@ async def run_agent(req: RunRequest):
                     "screenshot": result.screenshot_b64,
                     "elapsed_ms": result.elapsed_ms,
                 }
-                yield f"data: {json.dumps(event)}\n\n"
+                yield f"data: {json.dumps(event_payload)}\n\n"
 
                 if result.action.type == ActionType.DONE:
                     yield f"data: {json.dumps({'type': 'done', 'message': result.action.reason})}\n\n"
@@ -107,10 +123,10 @@ async def run_agent(req: RunRequest):
                     yield f"data: {json.dumps({'type': 'error', 'message': result.action.reason})}\n\n"
                     break
 
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
         finally:
-            # Clean up stop event registry
+            # Fix 3: clean up stop event after loop ends
             _stop_events.pop(session_id, None)
 
     return StreamingResponse(
@@ -118,19 +134,6 @@ async def run_agent(req: RunRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-
-
-@app.post("/stop/{session_id}")
-async def stop_session(session_id: str):
-    """
-    Signal a running session to stop cleanly after the current step.
-    Fix 3: AbortController pattern via asyncio.Event.
-    """
-    event = _stop_events.get(session_id)
-    if event is None:
-        raise HTTPException(404, f"Session '{session_id}' not found or already finished")
-    event.set()
-    return {"status": "stopping", "session_id": session_id}
 
 
 @app.get("/", response_class=HTMLResponse)
