@@ -1,16 +1,18 @@
 """
 Gemini Web Navigator — Core Agent Loop
-Uses Gemini 2.5 Computer Use model with built-in UI action tools.
-Screenshot → Gemini Computer Use → Action → Execute → Repeat
+Screenshot → Gemini 2.0 Flash vision → Action → Execute → Repeat
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from io import BytesIO
 from typing import AsyncGenerator, Optional
 
 from google import genai
@@ -19,7 +21,7 @@ from playwright.async_api import Page, async_playwright
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL = "gemini-2.5-computer-use-preview-10-2025"
+MODEL = "gemini-2.0-flash-exp"
 MAX_STEPS = 25
 SCREENSHOT_WIDTH = 1280
 SCREENSHOT_HEIGHT = 800
@@ -33,10 +35,6 @@ class ActionType(str, Enum):
     WAIT = "wait"
     DONE = "done"
     FAIL = "fail"
-    SCREENSHOT = "screenshot"
-    KEY = "key"
-    MOVE_MOUSE = "move_mouse"
-    DRAG = "drag"
 
 
 @dataclass
@@ -46,13 +44,9 @@ class Action:
     y: Optional[int] = None
     text: Optional[str] = None
     url: Optional[str] = None
-    direction: Optional[str] = None
-    amount: Optional[int] = None
+    direction: Optional[str] = None  # up/down
+    amount: Optional[int] = None     # scroll pixels
     reason: Optional[str] = None
-    # Computer Use extras
-    key: Optional[str] = None
-    coordinate: Optional[list] = None
-    start_coordinate: Optional[list] = None
 
 
 @dataclass
@@ -65,157 +59,130 @@ class StepResult:
     elapsed_ms: int
 
 
-# ── Gemini Computer Use ───────────────────────────────────────────────────────
+# ── Gemini Vision ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a web navigation agent. You observe browser screenshots and decide what action to take to accomplish the user's goal.
+
+You MUST respond with a single JSON object — no markdown, no explanation outside the JSON.
+
+Available actions:
+- {"action": "click", "x": <int>, "y": <int>, "reason": "<why>"}
+- {"action": "type", "text": "<text to type>", "reason": "<why>"}
+- {"action": "scroll", "direction": "down"|"up", "amount": 300, "reason": "<why>"}
+- {"action": "navigate", "url": "<full URL>", "reason": "<why>"}
+- {"action": "wait", "reason": "<why>"}
+- {"action": "done", "reason": "<what was accomplished>"}
+- {"action": "fail", "reason": "<why it cannot be done>"}
+
+Rules:
+1. Analyze the screenshot carefully — read text, identify buttons, forms, links
+2. Choose the single most effective next action toward the goal
+3. For clicks, use pixel coordinates (x=0,y=0 is top-left, x=1280,y=800 is bottom-right)
+4. For typing, assume the correct field is already focused (after clicking it)
+5. If the goal is achieved, respond with "done"
+6. If blocked by CAPTCHA or login wall you cannot pass, respond with "fail"
+7. NEVER access DOM or APIs — only use what you see in the screenshot
+"""
+
+
+def _build_gemini_request(
+    client: genai.Client,
+    image_bytes: bytes,
+    prompt: str,
+) -> str:
+    """Call Gemini and return the raw text response."""
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        inline_data=types.Blob(
+                            mime_type="image/png",
+                            data=image_bytes,  # raw bytes — no PIL re-encoding
+                        )
+                    ),
+                    types.Part(text=prompt),
+                ],
+            )
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.1,
+            max_output_tokens=512,
+        ),
+    )
+    return response.text.strip()
+
+
+def _strip_markdown(raw: str) -> str:
+    raw = re.sub(r"^```(?:json)?\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    return raw
+
 
 async def get_next_action(
     client: genai.Client,
     screenshot_b64: str,
     goal: str,
     history: list[dict],
-    conversation: list,
-) -> tuple[Action, list]:
+) -> Action:
+    """Send screenshot to Gemini 2.0 Flash and get the next action.
+
+    Fix 1: screenshot bytes are sent directly — no PIL decode/re-encode round-trip.
+    Fix 2: JSON parse failures retry up to 3 times with fresh Gemini calls before
+           falling back to a FAIL action instead of raising.
     """
-    Call Gemini 2.5 Computer Use model with screenshot and get the next action.
-    Uses built-in Computer Use tool — no custom JSON parsing needed.
-    Returns (Action, updated_conversation).
-    """
+
+    # Build history context (last 5 steps)
+    history_text = ""
+    if history:
+        recent = history[-5:]
+        history_text = "\n\nRecent actions taken:\n" + "\n".join(
+            f"Step {h['step']}: {h['action']} — {h['message']}" for h in recent
+        )
+
+    prompt = f"Goal: {goal}{history_text}\n\nWhat is the next action to take? Respond with JSON only."
+
+    # Fix 1: decode once — send raw bytes, skip PIL re-encoding
     image_bytes = base64.b64decode(screenshot_b64)
 
-    # Build the user turn with screenshot
-    user_parts = [
-        types.Part(
-            inline_data=types.Blob(
-                mime_type="image/png",
-                data=image_bytes,
-            )
-        ),
-    ]
-
-    # On first step, include the goal; subsequent steps just send the screenshot
-    if not conversation:
-        user_parts.append(types.Part(text=f"Goal: {goal}\n\nPlease analyze this screenshot and take the next action to accomplish the goal."))
+    # Fix 2: retry loop — re-call Gemini on JSON parse failure
+    last_err: Exception | None = None
+    raw: str = ""
+    for attempt in range(3):
+        try:
+            raw = _build_gemini_request(client, image_bytes, prompt)
+            raw = _strip_markdown(raw)
+            data = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+        except Exception as e:
+            # Non-JSON error (network, API quota, etc.) — don't retry
+            return Action(type=ActionType.FAIL, reason=f"Gemini error: {e}")
     else:
-        user_parts.append(types.Part(text="Here is the current state of the browser. Continue working toward the goal."))
-
-    conversation.append(types.Content(role="user", parts=user_parts))
-
-    try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=conversation,
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(computer_use=types.ToolComputerUse(
-                    environment=types.Environment.ENVIRONMENT_BROWSER
-                ))],
-                temperature=0.1,
-                max_output_tokens=1024,
-            ),
+        return Action(
+            type=ActionType.FAIL,
+            reason=f"JSON parse failed after 3 retries: {last_err}. Raw: {raw[:200]}",
         )
-    except Exception as e:
-        return Action(type=ActionType.FAIL, reason=f"Gemini API error: {e}"), conversation
 
-    # Append model response to conversation
-    conversation.append(response.candidates[0].content)
+    action_type = ActionType(data.get("action", "fail"))
 
-    # Extract the function call (Computer Use action)
-    action = _parse_computer_use_response(response)
-    return action, conversation
-
-
-def _parse_computer_use_response(response) -> Action:
-    """Parse Gemini Computer Use response into an Action."""
-    candidate = response.candidates[0]
-    content = candidate.content
-
-    # Check finish reason for done/stop signals
-    finish_reason = candidate.finish_reason
-    if finish_reason and finish_reason.name in ("STOP", "MAX_TOKENS"):
-        # Check if there's text indicating completion
-        for part in content.parts:
-            if hasattr(part, 'text') and part.text:
-                text_lower = part.text.lower()
-                if any(w in text_lower for w in ["completed", "accomplished", "done", "finished", "found"]):
-                    return Action(type=ActionType.DONE, reason=part.text[:200])
-
-    # Look for function call parts
-    for part in content.parts:
-        if hasattr(part, 'function_call') and part.function_call:
-            fc = part.function_call
-            name = fc.name
-            args = dict(fc.args) if fc.args else {}
-
-            if name == "computer_use_click":
-                coord = args.get("coordinate", [0, 0])
-                return Action(
-                    type=ActionType.CLICK,
-                    x=int(coord[0]) if coord else 0,
-                    y=int(coord[1]) if coord else 0,
-                    reason=args.get("reason", "click"),
-                )
-            elif name == "computer_use_type":
-                return Action(
-                    type=ActionType.TYPE,
-                    text=args.get("text", ""),
-                    reason="type text",
-                )
-            elif name == "computer_use_scroll":
-                coord = args.get("coordinate", [640, 400])
-                direction = args.get("direction", "down")
-                amount = args.get("amount", 3)
-                return Action(
-                    type=ActionType.SCROLL,
-                    x=int(coord[0]) if coord else 640,
-                    y=int(coord[1]) if coord else 400,
-                    direction=direction,
-                    amount=int(amount) * 100,
-                    reason="scroll",
-                )
-            elif name == "computer_use_key":
-                return Action(
-                    type=ActionType.KEY,
-                    key=args.get("key", ""),
-                    reason="key press",
-                )
-            elif name == "computer_use_move_mouse":
-                coord = args.get("coordinate", [640, 400])
-                return Action(
-                    type=ActionType.MOVE_MOUSE,
-                    x=int(coord[0]) if coord else 640,
-                    y=int(coord[1]) if coord else 400,
-                    reason="move mouse",
-                )
-            elif name == "computer_use_screenshot":
-                return Action(type=ActionType.SCREENSHOT, reason="take screenshot")
-            elif name == "computer_use_navigate":
-                return Action(
-                    type=ActionType.NAVIGATE,
-                    url=args.get("url", ""),
-                    reason="navigate",
-                )
-            elif name == "computer_use_drag":
-                start = args.get("startCoordinate", [0, 0])
-                end = args.get("endCoordinate", [0, 0])
-                return Action(
-                    type=ActionType.DRAG,
-                    start_coordinate=start,
-                    coordinate=end,
-                    reason="drag",
-                )
-            else:
-                # Unknown function call — treat as wait
-                return Action(type=ActionType.WAIT, reason=f"unknown action: {name}")
-
-    # No function call — check for text response indicating completion or failure
-    for part in content.parts:
-        if hasattr(part, 'text') and part.text:
-            text_lower = part.text.lower()
-            if any(w in text_lower for w in ["cannot", "unable", "blocked", "captcha", "login required"]):
-                return Action(type=ActionType.FAIL, reason=part.text[:200])
-            if any(w in text_lower for w in ["completed", "accomplished", "done", "finished"]):
-                return Action(type=ActionType.DONE, reason=part.text[:200])
-
-    # Default: wait and retry
-    return Action(type=ActionType.WAIT, reason="waiting for model direction")
+    return Action(
+        type=action_type,
+        x=data.get("x"),
+        y=data.get("y"),
+        text=data.get("text"),
+        url=data.get("url"),
+        direction=data.get("direction"),
+        amount=data.get("amount", 300),
+        reason=data.get("reason", ""),
+    )
 
 
 # ── Browser Actions ───────────────────────────────────────────────────────────
@@ -228,10 +195,17 @@ async def take_screenshot(page: Page) -> str:
 
 
 async def _wait_for_navigation(page: Page, timeout_ms: int = 3000) -> None:
-    """SPA-safe post-click wait — domcontentloaded + fallback sleep."""
+    """SPA-safe post-click wait.
+
+    Fix 7: the original code used wait_for_load_state("networkidle", timeout=5000)
+    which hangs indefinitely on SPAs that keep background connections open.
+    Strategy: try domcontentloaded first (fast), then a short fixed sleep as
+    fallback. Never block on networkidle after a click.
+    """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
     except Exception:
+        # No navigation occurred (SPA click, JS handler, etc.) — just wait briefly
         await asyncio.sleep(0.5)
 
 
@@ -240,46 +214,22 @@ async def execute_action(page: Page, action: Action) -> tuple[bool, str]:
     try:
         if action.type == ActionType.CLICK:
             await page.mouse.click(action.x, action.y)
-            await _wait_for_navigation(page)
+            await _wait_for_navigation(page)  # Fix 7: SPA-safe, replaces networkidle
             return True, f"Clicked at ({action.x}, {action.y})"
 
         elif action.type == ActionType.TYPE:
             await page.keyboard.type(action.text, delay=50)
-            return True, f"Typed: {action.text[:50]}"
-
-        elif action.type == ActionType.KEY:
-            await page.keyboard.press(action.key)
-            await _wait_for_navigation(page)
-            return True, f"Key press: {action.key}"
+            return True, f"Typed: {action.text[:50]}..."
 
         elif action.type == ActionType.SCROLL:
-            x = action.x or 640
-            y = action.y or 400
-            delta = action.amount if action.direction == "down" else -(action.amount or 300)
-            await page.mouse.move(x, y)
+            delta = action.amount if action.direction == "down" else -action.amount
             await page.mouse.wheel(0, delta)
             await asyncio.sleep(0.5)
-            return True, f"Scrolled {action.direction} {abs(delta)}px at ({x},{y})"
+            return True, f"Scrolled {action.direction} {action.amount}px"
 
         elif action.type == ActionType.NAVIGATE:
             await page.goto(action.url, wait_until="domcontentloaded", timeout=30000)
             return True, f"Navigated to {action.url}"
-
-        elif action.type == ActionType.MOVE_MOUSE:
-            await page.mouse.move(action.x, action.y)
-            return True, f"Moved mouse to ({action.x}, {action.y})"
-
-        elif action.type == ActionType.DRAG:
-            start = action.start_coordinate or [0, 0]
-            end = action.coordinate or [0, 0]
-            await page.mouse.move(start[0], start[1])
-            await page.mouse.down()
-            await page.mouse.move(end[0], end[1])
-            await page.mouse.up()
-            return True, f"Dragged from {start} to {end}"
-
-        elif action.type == ActionType.SCREENSHOT:
-            return True, "Screenshot taken"
 
         elif action.type == ActionType.WAIT:
             await asyncio.sleep(2)
@@ -307,12 +257,15 @@ async def run_navigator(
     stop_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[StepResult, None]:
     """
-    Core agent loop using Gemini 2.5 Computer Use model.
-    Screenshot → Gemini Computer Use → Action → Execute → Repeat.
+    Core agent loop: screenshot → Gemini vision → action → execute → repeat.
     Yields StepResult for each step (for SSE streaming).
+
+    Args:
+        stop_event: optional asyncio.Event; when set, the loop exits cleanly
+                    after the current step completes.
     """
     client = genai.Client(api_key=api_key)
-    conversation: list = []
+    history: list[dict] = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -328,8 +281,6 @@ async def run_navigator(
         # Navigate to start URL
         await page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
 
-        history: list[dict] = []
-
         for step in range(1, MAX_STEPS + 1):
             # Honour stop signal before each step
             if stop_event is not None and stop_event.is_set():
@@ -340,10 +291,8 @@ async def run_navigator(
             # 1. Screenshot
             screenshot_b64 = await take_screenshot(page)
 
-            # 2. Gemini Computer Use → action
-            action, conversation = await get_next_action(
-                client, screenshot_b64, goal, history, conversation
-            )
+            # 2. Gemini vision → action
+            action = await get_next_action(client, screenshot_b64, goal, history)
 
             # 3. Execute
             success, message = await execute_action(page, action)
