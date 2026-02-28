@@ -183,6 +183,7 @@
 
 <script>
   let evtSource = null;
+  let currentSessionId = null;
 
   function setExample(btn) {
     document.getElementById('goal').value = btn.textContent.trim();
@@ -275,6 +276,8 @@
               updateScreenshot(evt.screenshot, evt.step);
               addLog('step', evt.step, evt.action, evt.message, evt.elapsed_ms);
               setStatus('running', `Step ${evt.step}: ${evt.action} — ${evt.message}`);
+            } else if (evt.type === 'session') {
+              currentSessionId = evt.session_id;
             } else if (evt.type === 'done') {
               addLog('done', null, 'DONE', evt.message, null);
               setStatus('done', '✅ ' + evt.message);
@@ -296,7 +299,9 @@
   }
 
   function stopAgent() {
-    // Abort by closing — server will clean up
+    if (currentSessionId) {
+      fetch('/stop/' + currentSessionId, { method: 'POST' });
+    }
     setStatus('', 'Stopped by user');
     addLog('info', null, 'STOP', 'Agent stopped by user', null);
     resetButtons();
